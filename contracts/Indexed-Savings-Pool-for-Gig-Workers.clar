@@ -194,3 +194,84 @@
     err-not-found
   )
 )
+
+
+(define-constant err-emergency-penalty-exceeds-balance (err u107))
+
+(define-private (calculate-emergency-penalty 
+  (goal-data { 
+    owner: principal, 
+    target-amount: uint, 
+    current-amount: uint, 
+    creation-block: uint, 
+    lock-duration: uint, 
+    is-active: bool 
+  })
+  (current-block-height uint))
+  (let
+    (
+      (blocks-elapsed (- current-block-height (get creation-block goal-data)))
+      (total-lock-blocks (get lock-duration goal-data))
+      (time-progress (if (> total-lock-blocks u0) (/ (* blocks-elapsed u100) total-lock-blocks) u0))
+      (penalty-rate (if (< time-progress u25) u20
+                     (if (< time-progress u50) u15
+                     (if (< time-progress u75) u10 u5))))
+      (penalty-amount (/ (* (get current-amount goal-data) penalty-rate) u100))
+    )
+    { penalty: penalty-amount, rate: penalty-rate }
+  )
+)
+
+(define-public (emergency-withdraw (goal-id uint))
+  (let
+    (
+      (goal (unwrap! (map-get? savings-goals { goal-id: goal-id }) err-not-found))
+      (current-block burn-block-height)
+      (unlock-block (+ (get creation-block goal) (get lock-duration goal)))
+      (is-locked (< current-block unlock-block))
+      (is-goal-unmet (< (get current-amount goal) (get target-amount goal)))
+      (requires-penalty (and is-locked is-goal-unmet))
+      (penalty-data (calculate-emergency-penalty goal current-block))
+      (penalty-amount (get penalty penalty-data))
+      (withdrawal-amount (- (get current-amount goal) penalty-amount))
+    )
+    (asserts! (is-eq tx-sender (get owner goal)) err-owner-only)
+    (asserts! (get is-active goal) err-goal-locked)
+    (asserts! requires-penalty err-goal-locked)
+    (asserts! (> (get current-amount goal) u0) err-insufficient-funds)
+    (asserts! (>= (get current-amount goal) penalty-amount) err-emergency-penalty-exceeds-balance)
+    
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender (get owner goal))))
+    
+    (var-set total-interest (+ (var-get total-interest) penalty-amount))
+    (var-set pool-balance (- (var-get pool-balance) withdrawal-amount))
+    
+    (map-set savings-goals
+      { goal-id: goal-id }
+      (merge goal { current-amount: u0, is-active: false })
+    )
+    
+    (ok { withdrawn: withdrawal-amount, penalty: penalty-amount, penalty-rate: (get rate penalty-data) })
+  )
+)
+
+(define-read-only (preview-emergency-withdrawal (goal-id uint))
+  (match (map-get? savings-goals { goal-id: goal-id })
+    goal
+    (let
+      (
+        (current-block burn-block-height)
+        (penalty-data (calculate-emergency-penalty goal current-block))
+        (penalty-amount (get penalty penalty-data))
+        (net-withdrawal (- (get current-amount goal) penalty-amount))
+      )
+      (ok {
+        current-balance: (get current-amount goal),
+        penalty-amount: penalty-amount,
+        penalty-rate: (get rate penalty-data),
+        net-withdrawal: net-withdrawal
+      })
+    )
+    err-not-found
+  )
+)
