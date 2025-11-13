@@ -7,6 +7,9 @@
 (define-constant err-goal-not-met (err u105))
 (define-constant err-invalid-amount (err u106))
 
+(define-constant err-milestone-already-claimed (err u108))
+(define-constant err-milestone-not-reached (err u109))
+
 (define-data-var pool-balance uint u0)
 (define-data-var total-interest uint u0)
 (define-data-var next-goal-id uint u1)
@@ -270,6 +273,82 @@
         penalty-amount: penalty-amount,
         penalty-rate: (get rate penalty-data),
         net-withdrawal: net-withdrawal
+      })
+    )
+    err-not-found
+  )
+)
+
+(define-map milestone-claims
+  { goal-id: uint, milestone: uint }
+  { claimed: bool }
+)
+
+(define-private (calculate-milestone-reward (target-amount uint) (milestone-level uint))
+  (let
+    (
+      (base-reward (/ target-amount u100))
+      (milestone-multiplier (if (is-eq milestone-level u25) u1
+                            (if (is-eq milestone-level u50) u2
+                            (if (is-eq milestone-level u75) u3 u0))))
+    )
+    (* base-reward milestone-multiplier)
+  )
+)
+
+(define-private (get-milestone-percentage (current-amount uint) (target-amount uint))
+  (if (is-eq target-amount u0)
+    u0
+    (/ (* current-amount u100) target-amount)
+  )
+)
+
+(define-public (claim-milestone-reward (goal-id uint))
+  (let
+    (
+      (goal (unwrap! (map-get? savings-goals { goal-id: goal-id }) err-not-found))
+      (progress-pct (get-milestone-percentage (get current-amount goal) (get target-amount goal)))
+      (milestone (if (>= progress-pct u75) u75
+                 (if (>= progress-pct u50) u50
+                 (if (>= progress-pct u25) u25 u0))))
+      (already-claimed (default-to false (get claimed (map-get? milestone-claims { goal-id: goal-id, milestone: milestone }))))
+      (reward-amount (calculate-milestone-reward (get target-amount goal) milestone))
+      (available-interest (var-get total-interest))
+    )
+    (asserts! (is-eq tx-sender (get owner goal)) err-owner-only)
+    (asserts! (get is-active goal) err-goal-locked)
+    (asserts! (> milestone u0) err-milestone-not-reached)
+    (asserts! (not already-claimed) err-milestone-already-claimed)
+    (asserts! (>= available-interest reward-amount) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? reward-amount tx-sender (get owner goal))))
+    
+    (map-set milestone-claims
+      { goal-id: goal-id, milestone: milestone }
+      { claimed: true }
+    )
+    
+    (var-set total-interest (- available-interest reward-amount))
+    
+    (ok { milestone: milestone, reward: reward-amount })
+  )
+)
+
+(define-read-only (get-available-milestones (goal-id uint))
+  (match (map-get? savings-goals { goal-id: goal-id })
+    goal
+    (let
+      (
+        (progress-pct (get-milestone-percentage (get current-amount goal) (get target-amount goal)))
+        (milestone-25-claimed (default-to false (get claimed (map-get? milestone-claims { goal-id: goal-id, milestone: u25 }))))
+        (milestone-50-claimed (default-to false (get claimed (map-get? milestone-claims { goal-id: goal-id, milestone: u50 }))))
+        (milestone-75-claimed (default-to false (get claimed (map-get? milestone-claims { goal-id: goal-id, milestone: u75 }))))
+      )
+      (ok {
+        progress: progress-pct,
+        milestone-25-available: (and (>= progress-pct u25) (not milestone-25-claimed)),
+        milestone-50-available: (and (>= progress-pct u50) (not milestone-50-claimed)),
+        milestone-75-available: (and (>= progress-pct u75) (not milestone-75-claimed))
       })
     )
     err-not-found
